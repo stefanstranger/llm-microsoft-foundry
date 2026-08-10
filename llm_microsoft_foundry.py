@@ -291,6 +291,15 @@ class FoundryModel(llm.Model):
             body["top_p"] = opts.top_p
         return body
 
+    @staticmethod
+    def _switch_to_max_completion_tokens(body: dict) -> dict:
+        """Translate max_tokens to max_completion_tokens in a request body copy."""
+        if "max_tokens" not in body:
+            return body
+        updated = dict(body)
+        updated["max_completion_tokens"] = updated.pop("max_tokens")
+        return updated
+
     def execute(self, prompt, stream, response, conversation) -> Iterator[str]:
         token = _get_access_token()
         headers = {
@@ -307,6 +316,19 @@ class FoundryModel(llm.Model):
                 r = client.post(
                     self._chat_url(), headers=headers, json=body, timeout=120
                 )
+                if r.status_code >= 400:
+                    try:
+                        detail = r.json()
+                    except Exception:
+                        detail = None
+                    if _wants_max_completion_tokens(detail) and "max_tokens" in body:
+                        body = self._switch_to_max_completion_tokens(body)
+                        r = client.post(
+                            self._chat_url(),
+                            headers=headers,
+                            json=body,
+                            timeout=120,
+                        )
                 _raise_for_status(r)
                 data = r.json()
                 choice = data["choices"][0]
@@ -316,35 +338,49 @@ class FoundryModel(llm.Model):
 
     def _stream(self, headers: dict, body: dict, response) -> Iterator[str]:
         chunks: list = []
+        attempts = [body]
+        if "max_tokens" in body:
+            attempts.append(self._switch_to_max_completion_tokens(body))
+
         with httpx.Client() as client:
-            with client.stream(
-                "POST",
-                self._chat_url(),
-                headers=headers,
-                json=body,
-                timeout=120,
-            ) as r:
-                if r.status_code >= 400:
-                    r.read()  # must consume body before accessing it in stream context
-                    _raise_for_status(r)
-                for line in r.iter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    payload = line[len("data: "):]
-                    if payload.strip() == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                    chunks.append(chunk)
-                    choices = chunk.get("choices")
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta", {})
-                    text = delta.get("content") or ""
-                    if text:
-                        yield text
+            for index, attempt_body in enumerate(attempts):
+                with client.stream(
+                    "POST",
+                    self._chat_url(),
+                    headers=headers,
+                    json=attempt_body,
+                    timeout=120,
+                ) as r:
+                    if r.status_code >= 400:
+                        r.read()  # must consume body before accessing it in stream context
+                        if index == 0 and "max_tokens" in attempt_body:
+                            try:
+                                detail = r.json()
+                            except Exception:
+                                detail = None
+                            if _wants_max_completion_tokens(detail):
+                                continue
+                        _raise_for_status(r)
+
+                    for line in r.iter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        payload = line[len("data: "):]
+                        if payload.strip() == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+                        chunks.append(chunk)
+                        choices = chunk.get("choices")
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
+                        text = delta.get("content") or ""
+                        if text:
+                            yield text
+                    break
         if chunks:
             response.response_json = chunks[-1]
 
@@ -387,3 +423,22 @@ def _raise_for_status(r: httpx.Response):
         raise click.ClickException(
             f"Foundry API error {r.status_code}: {json.dumps(detail, indent=2)}"
         )
+
+
+def _wants_max_completion_tokens(error_detail) -> bool:
+    """Return True if API asks to use max_completion_tokens instead of max_tokens."""
+    if not isinstance(error_detail, dict):
+        return False
+    err = error_detail.get("error")
+    if not isinstance(err, dict):
+        return False
+
+    param = err.get("param")
+    code = err.get("code")
+    message = str(err.get("message", "")).lower()
+
+    return (
+        param == "max_tokens"
+        and code == "unsupported_parameter"
+        and "max_completion_tokens" in message
+    )
