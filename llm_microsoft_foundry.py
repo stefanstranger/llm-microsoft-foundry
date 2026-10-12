@@ -5,11 +5,13 @@ Authentication is handled transparently via azure-identity
 (DefaultAzureCredential), which picks up an `az login` session.
 No API key is required; bearer tokens are fetched and cached automatically.
 """
+
 from __future__ import annotations
 
 import json
 import time
-from typing import Iterator, Optional
+from collections.abc import Iterator, Mapping
+from typing import Any
 
 import click
 import httpx
@@ -21,17 +23,24 @@ from pydantic import Field
 # Token helpers
 # ---------------------------------------------------------------------------
 
-_FOUNDRY_SCOPE = "https://ai.azure.com/.default"
-_FOUNDRY_API_VERSION = "v1"
+_FOUNDRY_CHAT_SCOPE = "https://ai.azure.com/.default"
+_FOUNDRY_DECISION_SCOPE = "https://cognitiveservices.azure.com/.default"
 
-_token_cache: dict = {}  # {"token": str, "expires_on": float}
+_token_cache: dict[str, dict[str, str | float]] = {}
 
 
-def _get_access_token() -> str:
+def _get_access_token(scope: str = _FOUNDRY_CHAT_SCOPE) -> str:
     """Return a cached (or freshly fetched) Entra access token."""
     now = time.time()
-    if _token_cache.get("token") and _token_cache.get("expires_on", 0) > now + 60:
-        return _token_cache["token"]
+    cached = _token_cache.get(scope, {})
+    cached_token = cached.get("token")
+    expires_on = cached.get("expires_on", 0)
+    if (
+        isinstance(cached_token, str)
+        and isinstance(expires_on, (int, float))
+        and expires_on > now + 60
+    ):
+        return cached_token
 
     try:
         from azure.identity import DefaultAzureCredential
@@ -41,9 +50,11 @@ def _get_access_token() -> str:
         ) from exc
 
     credential = DefaultAzureCredential()
-    token = credential.get_token(_FOUNDRY_SCOPE)
-    _token_cache["token"] = token.token
-    _token_cache["expires_on"] = token.expires_on
+    token = credential.get_token(scope)
+    _token_cache[scope] = {
+        "token": token.token,
+        "expires_on": token.expires_on,
+    }
     return token.token
 
 
@@ -56,13 +67,25 @@ def _get_access_token() -> str:
 def register_models(register):
     config = _load_config()
     for entry in config.get("models", []):
-        model = FoundryModel(
-            model_id=entry["model_id"],
-            deployment=entry.get("deployment", entry["model_id"]),
-            api_base=entry["api_base"],
-            supports_tools=entry.get("supports_tools", False),
-            supports_vision=entry.get("supports_vision", False),
-        )
+        api_type = entry.get("api_type", "chat")
+        common_args = {
+            "model_id": entry["model_id"],
+            "deployment": entry.get("deployment", entry["model_id"]),
+            "api_base": entry["api_base"],
+        }
+        if api_type == "chat":
+            model = FoundryModel(
+                **common_args,
+                supports_tools=entry.get("supports_tools", False),
+                supports_vision=entry.get("supports_vision", False),
+            )
+        elif api_type == "decision":
+            model = FoundryDecisionModel(**common_args)
+        else:
+            raise click.ClickException(
+                f"Unsupported api_type {api_type!r} for model "
+                f"{entry['model_id']!r}. Expected 'chat' or 'decision'."
+            )
         aliases = entry.get("aliases", [])
         register(model, aliases=aliases)
 
@@ -87,22 +110,52 @@ def register_commands(cli):
         for m in models:
             click.echo(
                 f"{m['model_id']!r}  ->  {m['api_base']}  "
-                f"(deployment: {m.get('deployment', m['model_id'])})"
+                f"(deployment: {m.get('deployment', m['model_id'])}, "
+                f"api type: {m.get('api_type', 'chat')})"
             )
 
     @foundry_group.command(name="add-model")
-    @click.option("--model-id", required=True, help="Local model identifier (e.g. foundry-gpt-5.4)")
+    @click.option(
+        "--model-id",
+        required=True,
+        help="Local model identifier (e.g. foundry-gpt-5.4)",
+    )
     @click.option(
         "--api-base",
         required=True,
         help="Foundry resource root URL, e.g. https://my-resource.services.ai.azure.com",
     )
-    @click.option("--deployment", default=None, help="Exact deployment name (defaults to model-id)")
-    @click.option("--tools/--no-tools", default=False, help="Whether the model supports tool calling")
-    @click.option("--vision/--no-vision", default=False, help="Whether the model supports image input")
-    @click.option("--alias", "aliases", multiple=True, help="Short alias(es) for the model")
-    def add_model(model_id, api_base, deployment, tools, vision, aliases):
+    @click.option(
+        "--deployment",
+        default=None,
+        help="Exact deployment name (defaults to model-id)",
+    )
+    @click.option(
+        "--api-type",
+        type=click.Choice(["chat", "decision"]),
+        default="chat",
+        show_default=True,
+        help="Foundry inference API exposed by the deployment",
+    )
+    @click.option(
+        "--tools/--no-tools",
+        default=False,
+        help="Whether the model supports tool calling",
+    )
+    @click.option(
+        "--vision/--no-vision",
+        default=False,
+        help="Whether the model supports image input",
+    )
+    @click.option(
+        "--alias", "aliases", multiple=True, help="Short alias(es) for the model"
+    )
+    def add_model(model_id, api_base, deployment, api_type, tools, vision, aliases):
         "Add a Microsoft Foundry model to the configuration"
+        if api_type == "decision" and (tools or vision):
+            raise click.UsageError(
+                "Decision models do not support --tools or --vision."
+            )
         config = _load_config()
         models = config.setdefault("models", [])
         # Replace existing entry with same model_id
@@ -111,6 +164,7 @@ def register_commands(cli):
             "model_id": model_id,
             "api_base": api_base.rstrip("/"),
             "deployment": deployment or model_id,
+            "api_type": api_type,
             "supports_tools": tools,
             "supports_vision": vision,
         }
@@ -127,7 +181,9 @@ def register_commands(cli):
         "Remove a Microsoft Foundry model from the configuration"
         config = _load_config()
         before = len(config.get("models", []))
-        config["models"] = [m for m in config.get("models", []) if m["model_id"] != model_id]
+        config["models"] = [
+            m for m in config.get("models", []) if m["model_id"] != model_id
+        ]
         _save_config(config)
         removed = before - len(config["models"])
         click.echo(f"Removed {removed} model(s).")
@@ -202,18 +258,18 @@ class FoundryModel(llm.Model):
     can_stream = True
 
     class Options(llm.Options):
-        temperature: Optional[float] = Field(
+        temperature: float | None = Field(
             description="Sampling temperature (0–2). Higher = more random.",
             ge=0,
             le=2,
             default=None,
         )
-        max_tokens: Optional[int] = Field(
+        max_tokens: int | None = Field(
             description="Maximum number of tokens to generate.",
             ge=1,
             default=None,
         )
-        top_p: Optional[float] = Field(
+        top_p: float | None = Field(
             description="Nucleus sampling probability mass.",
             ge=0,
             le=1,
@@ -319,7 +375,7 @@ class FoundryModel(llm.Model):
                 if r.status_code >= 400:
                     try:
                         detail = r.json()
-                    except Exception:
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         detail = None
                     if _wants_max_completion_tokens(detail) and "max_tokens" in body:
                         body = self._switch_to_max_completion_tokens(body)
@@ -356,7 +412,7 @@ class FoundryModel(llm.Model):
                         if index == 0 and "max_tokens" in attempt_body:
                             try:
                                 detail = r.json()
-                            except Exception:
+                            except (json.JSONDecodeError, UnicodeDecodeError):
                                 detail = None
                             if _wants_max_completion_tokens(detail):
                                 continue
@@ -365,7 +421,7 @@ class FoundryModel(llm.Model):
                     for line in r.iter_lines():
                         if not line.startswith("data: "):
                             continue
-                        payload = line[len("data: "):]
+                        payload = line[len("data: ") :]
                         if payload.strip() == "[DONE]":
                             break
                         try:
@@ -383,6 +439,118 @@ class FoundryModel(llm.Model):
                     break
         if chunks:
             response.response_json = chunks[-1]
+
+
+def _parse_json_object(value: str | Mapping[str, Any], name: str) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be valid JSON: {exc.msg}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} must be a JSON object")  # noqa: TRY004
+    return parsed
+
+
+class FoundryDecisionModel(llm.Model):
+    can_stream = False
+
+    class Options(llm.Options):  # pyright: ignore[reportIncompatibleVariableOverride]
+        questions: str | dict[str, Any] | None = Field(
+            description=(
+                "Decision questions as a JSON object. When omitted, the prompt "
+                "must contain the complete Decision API request."
+            ),
+            default=None,
+        )
+
+    def __init__(self, model_id: str, deployment: str, api_base: str):
+        self.model_id = model_id
+        self.deployment = deployment
+        self.api_base = api_base.rstrip("/")
+
+    def _decision_url(self) -> str:
+        return f"{self.api_base}/providers/microsoft/v1/systemone"
+
+    def _build_body(self, prompt) -> dict[str, Any]:
+        if prompt.system:
+            raise ValueError("Decision models do not support system prompts")
+        if prompt.attachments:
+            raise ValueError("Decision models do not support attachments")
+
+        options = prompt.options
+        if not isinstance(options, self.Options):
+            raise TypeError("Decision API requires decision model options")
+
+        if options.questions is not None:
+            if prompt.prompt is None:
+                raise ValueError("Decision API state text is required")
+            return {
+                "model": self.deployment,
+                "state": prompt.prompt,
+                "questions": _parse_json_object(options.questions, "questions"),
+            }
+
+        if prompt.prompt is None:
+            raise ValueError(
+                "Provide a JSON request payload or state text with the questions option"
+            )
+
+        payload = _parse_json_object(prompt.prompt, "Decision API request")
+        if "state" not in payload:
+            raise ValueError("Decision API request must include state")
+        if not isinstance(payload.get("questions"), dict):
+            raise ValueError(  # noqa: TRY004
+                "Decision API request questions must be a JSON object"
+            )
+        payload["model"] = self.deployment
+        return payload
+
+    def execute(self, prompt, stream, response, conversation) -> Iterator[str]:
+        del stream
+        if conversation is not None and conversation.responses:
+            raise ValueError("Decision models do not support conversations")
+
+        token = _get_access_token(_FOUNDRY_DECISION_SCOPE)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        with httpx.Client() as client:
+            api_response = client.post(
+                self._decision_url(),
+                headers=headers,
+                json=self._build_body(prompt),
+                timeout=120,
+            )
+        _raise_for_status(api_response)
+
+        try:
+            data = api_response.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise click.ClickException(
+                "Foundry Decision API returned invalid JSON."
+            ) from exc
+        if not isinstance(data, dict):
+            raise click.ClickException(
+                "Foundry Decision API response must be a JSON object."
+            )
+
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            input_tokens = usage.get("input_tokens")
+            output_tokens = usage.get("output_tokens")
+            response.set_usage(
+                input=input_tokens if type(input_tokens) is int else None,
+                output=output_tokens if type(output_tokens) is int else None,
+            )
+
+        response.response_json = data
+        yield json.dumps(data, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -410,16 +578,18 @@ def _msg_content(text: str, attachments=None):
 
 def _raise_for_status(r: httpx.Response):
     if r.status_code >= 400:
-        try:
-            # Streaming responses need read() before accessing body
-            if not r.is_stream_consumed:
-                r.read()
-            detail = r.json()
-        except Exception:
+        # Streaming responses need read() before accessing body
+        if not r.is_stream_consumed:
             try:
-                detail = r.text
-            except Exception:
-                detail = f"HTTP {r.status_code}"
+                r.read()
+            except httpx.HTTPError as exc:
+                raise click.ClickException(
+                    f"Foundry API error {r.status_code}: {exc}"
+                ) from exc
+        try:
+            detail = r.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            detail = r.text
         raise click.ClickException(
             f"Foundry API error {r.status_code}: {json.dumps(detail, indent=2)}"
         )
