@@ -2,9 +2,31 @@
 title: Change Log
 description: Project change notes for llm-microsoft-foundry
 author: Microsoft
-ms.date: 2026-10-12
+ms.date: 2026-10-19
 ms.topic: reference
 ---
+
+## 2026-10-19
+
+Implemented tool calling for chat deployments configured with
+`supports_tools: true`.
+
+Previously the plugin accepted the `--tools` flag but never sent tool
+definitions to Foundry or read tool calls from its responses, so prompts using
+`--tool` returned plain text.
+
+The plugin now:
+
+* Sends selected LLM tools as OpenAI-style function tools
+* Registers tool calls from streaming and non-streaming responses with LLM
+* Assembles streamed tool-call fragments by index, including parallel calls
+* Sends assistant tool calls and `role=tool` results back to Foundry so LLM's
+  tool loop and `llm -c` conversations keep the full history
+* Raises a clear error when Foundry returns malformed tool-call arguments
+
+Tools run locally through LLM. The minimum LLM version is now 0.32, the first
+release with the `Prompt.messages` history and `llm.parts` types that carry
+tool calls and tool results between turns.
 
 ## 2026-10-12
 
