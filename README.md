@@ -47,7 +47,7 @@ llm foundry add-model \
 | `--api-base` | Foundry resource root URL (the **resource root**, not a project URL) |
 | `--deployment` | Exact deployment name in Foundry (defaults to `--model-id`) |
 | `--api-type` | Inference API exposed by the deployment: `chat` or `decision` |
-| `--tools` / `--no-tools` | Enable tool calling support |
+| `--tools` / `--no-tools` | Advertise tool calling for a chat deployment whose model supports it |
 | `--vision` / `--no-vision` | Enable image attachment support |
 | `--alias` | Short alias(es), repeatable |
 
@@ -112,6 +112,45 @@ llm -m foundry-gpt-5.4 -o temperature 0.2 -o max_tokens 512 "Write a haiku"
 | `temperature` | model default | Sampling temperature (0–2) |
 | `max_tokens` | model default | Max output tokens |
 | `top_p` | model default | Nucleus sampling probability |
+
+### Tools
+
+The plugin supports [LLM tool calling](https://llm.datasette.io/en/stable/tools.html)
+through the Foundry chat completions API. Two separate settings are involved:
+
+* `--tools` on `llm foundry add-model` (or `supports_tools: true` in the YAML
+  file) advertises that the deployment can accept tool definitions. Enable it
+  only for chat deployments whose model supports function calling. It is off by
+  default.
+* `--tool` (or `-T`) on an `llm` prompt selects which local tools LLM offers to
+  the model for that invocation. `--functions` works the same way for ad-hoc
+  Python functions.
+
+Pass an explicit `-m` so the request goes to the intended Foundry model rather
+than your default model:
+
+```powershell
+llm -m foundry-gpt-5.4 "What is the current UTC time?" --tool llm_time --td
+```
+
+`--td` (`--tools-debug`) prints each tool call and its result. Add
+`--ta` (`--tools-approve`) to confirm every call before it runs.
+
+When the model requests a tool, the plugin hands the call back to LLM. LLM runs
+the tool on your machine, applies any approval prompts, turns tool exceptions
+into error results, and sends the results to Foundry in a follow-up request
+until the model returns a final answer. Tools never execute inside Foundry, and
+the plugin does not run them itself. Conversations continued with `llm -c`
+include earlier tool calls and results.
+
+> [!NOTE]
+> Offering tools does not force the model to use them. The model decides
+> whether a tool is relevant, so it may answer directly in plain text. Tool
+> selection quality depends on the deployed model.
+
+If Foundry returns a tool call whose arguments are not a valid JSON object, the
+command stops with an error that shows the tool name, call ID, and raw
+arguments instead of running the tool with guessed input.
 
 ## Use Microsoft-Decision-1
 
@@ -217,6 +256,7 @@ llm CLI
        │    └─ uses the Azure CLI credential cache
        ├─ Chat
        │    └─ POST <api_base>/openai/v1/chat/completions
+       │         (tool calls are returned to LLM and run locally)
        └─ Decision
             └─ POST <api_base>/providers/microsoft/v1/systemone
 ```

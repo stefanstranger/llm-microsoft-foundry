@@ -300,35 +300,20 @@ class FoundryModel(llm.Model):
         return f"{self.api_base}/openai/v1/chat/completions"
 
     def _build_messages(self, prompt, conversation) -> list[dict]:
+        """Translate LLM's message chain into chat-completions messages.
+
+        ``prompt.messages`` is the full history LLM wants sent for this turn,
+        including earlier conversation turns, assistant tool calls, and
+        tool results, so ``conversation`` is not consulted here.
+        """
+        del conversation
         messages: list[dict] = []
+        current_system: str | None = None
+        for message in prompt.messages:
+            current_system = _append_message(messages, message, current_system)
 
-        if conversation:
-            for prev in conversation.responses:
-                if prev.prompt.system and not any(
-                    m.get("role") == "system" for m in messages
-                ):
-                    messages.append({"role": "system", "content": prev.prompt.system})
-                if prev.prompt.prompt:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": _msg_content(
-                                prev.prompt.prompt, prev.prompt.attachments
-                            ),
-                        }
-                    )
-                messages.append({"role": "assistant", "content": prev.text()})
-
-        if prompt.system and not any(m.get("role") == "system" for m in messages):
-            messages.append({"role": "system", "content": prompt.system})
-
-        if prompt.prompt:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": _msg_content(prompt.prompt, prompt.attachments),
-                }
-            )
+        if prompt.system and not any(m["role"] == "system" for m in messages):
+            messages.insert(0, {"role": "system", "content": prompt.system})
 
         return messages
 
@@ -338,6 +323,8 @@ class FoundryModel(llm.Model):
             "messages": self._build_messages(prompt, conversation),
             "stream": True,
         }
+        if prompt.tools:
+            body["tools"] = [_tool_spec(tool) for tool in prompt.tools]
         opts = prompt.options
         if opts.temperature is not None:
             body["temperature"] = opts.temperature
@@ -387,13 +374,26 @@ class FoundryModel(llm.Model):
                         )
                 _raise_for_status(r)
                 data = r.json()
-                choice = data["choices"][0]
-                text = choice["message"]["content"] or ""
                 response.response_json = data
-                yield text
+                message = data["choices"][0]["message"]
+                text = message.get("content") or ""
+                parsed_calls = [
+                    _parse_tool_call(
+                        tool_call.get("id"),
+                        (tool_call.get("function") or {}).get("name"),
+                        (tool_call.get("function") or {}).get("arguments"),
+                    )
+                    for tool_call in message.get("tool_calls") or []
+                ]
+                for tool_call in parsed_calls:
+                    response.add_tool_call(tool_call)
+                if text:
+                    yield text
 
     def _stream(self, headers: dict, body: dict, response) -> Iterator[str]:
         chunks: list = []
+        # Streamed tool calls arrive as fragments keyed by their index.
+        tool_calls: dict[int, dict[str, Any]] = {}
         attempts = [body]
         if "max_tokens" in body:
             attempts.append(self._switch_to_max_completion_tokens(body))
@@ -432,13 +432,21 @@ class FoundryModel(llm.Model):
                         choices = chunk.get("choices")
                         if not choices:
                             continue
-                        delta = choices[0].get("delta", {})
+                        delta = choices[0].get("delta") or {}
+                        for fragment in delta.get("tool_calls") or []:
+                            _merge_tool_call_fragment(tool_calls, fragment)
                         text = delta.get("content") or ""
                         if text:
                             yield text
                     break
         if chunks:
             response.response_json = chunks[-1]
+        parsed_calls = [
+            _parse_tool_call(call["id"], call["name"], call["arguments"])
+            for _, call in sorted(tool_calls.items())
+        ]
+        for tool_call in parsed_calls:
+            response.add_tool_call(tool_call)
 
 
 def _parse_json_object(value: str | Mapping[str, Any], name: str) -> dict[str, Any]:
@@ -574,6 +582,121 @@ def _msg_content(text: str, attachments=None):
             }
         )
     return content
+
+
+def _append_message(out: list[dict], message, current_system: str | None):
+    """Append one ``llm.parts.Message`` to ``out`` in chat-completions format.
+
+    Returns the active system prompt so repeated identical system messages
+    are only sent once.
+    """
+    from llm.parts import AttachmentPart, TextPart, ToolCallPart, ToolResultPart
+
+    text_bits: list[str] = []
+    attachments = []
+    tool_calls: list[dict] = []
+    for part in message.parts:
+        if isinstance(part, TextPart):
+            text_bits.append(part.text)
+        elif isinstance(part, AttachmentPart) and part.attachment:
+            attachments.append(part.attachment)
+        elif isinstance(part, ToolCallPart) and not part.server_executed:
+            tool_calls.append(
+                {
+                    "id": part.tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": part.name,
+                        "arguments": json.dumps(part.arguments),
+                    },
+                }
+            )
+        elif isinstance(part, ToolResultPart) and not part.server_executed:
+            out.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": part.tool_call_id,
+                    "content": part.output,
+                }
+            )
+
+    if message.role == "tool":
+        return current_system
+
+    text = "".join(text_bits)
+    if message.role == "system":
+        if not text or text == current_system:
+            return current_system
+        out.append({"role": "system", "content": text})
+        return text
+
+    if message.role == "assistant":
+        entry: dict[str, Any] = {"role": "assistant", "content": text}
+        if tool_calls:
+            entry["tool_calls"] = tool_calls
+            # Chat completions expects null content for tool-call-only turns.
+            if not text:
+                entry["content"] = None
+        out.append(entry)
+        return current_system
+
+    if text or attachments:
+        out.append({"role": message.role, "content": _msg_content(text, attachments)})
+    return current_system
+
+
+def _tool_spec(tool) -> dict:
+    """Describe an LLM tool in the chat-completions function-tool format."""
+    function: dict[str, Any] = {"name": tool.name}
+    if tool.description:
+        function["description"] = tool.description
+    function["parameters"] = tool.input_schema
+    return {"type": "function", "function": function}
+
+
+def _merge_tool_call_fragment(
+    tool_calls: dict[int, dict[str, Any]], fragment: Mapping[str, Any]
+) -> None:
+    """Fold one streamed tool-call delta into the call at its index."""
+    index = fragment.get("index")
+    if not isinstance(index, int):
+        raise click.ClickException(
+            f"Foundry streamed a tool call without an index: {json.dumps(fragment)}"
+        )
+    call = tool_calls.setdefault(index, {"id": None, "name": None, "arguments": ""})
+    if fragment.get("id") and not call["id"]:
+        call["id"] = fragment["id"]
+    function = fragment.get("function") or {}
+    if function.get("name") and not call["name"]:
+        call["name"] = function["name"]
+    if function.get("arguments"):
+        call["arguments"] += function["arguments"]
+
+
+def _parse_tool_call(
+    tool_call_id: str | None, name: str | None, arguments: str | None
+) -> llm.ToolCall:
+    """Build an ``llm.ToolCall``, rejecting missing names or malformed arguments."""
+    label = f"tool call {tool_call_id!r}" + (f" to {name!r}" if name else "")
+    if not name:
+        raise click.ClickException(f"Foundry returned {label} without a function name.")
+    # An absent or empty argument string means the function takes no arguments.
+    if arguments is None or not arguments.strip():
+        parsed: Any = {}
+    else:
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            raise click.ClickException(
+                f"Foundry returned malformed JSON arguments for {label}: "
+                f"{exc.msg}. Raw arguments: {arguments}"
+            ) from exc
+    if not isinstance(parsed, dict):
+        raise click.ClickException(
+            f"Foundry returned arguments for {label} that are not a JSON object. "
+            f"Raw arguments: {arguments}"
+        )
+    return llm.ToolCall(name=name, arguments=parsed, tool_call_id=tool_call_id)
 
 
 def _raise_for_status(r: httpx.Response):
