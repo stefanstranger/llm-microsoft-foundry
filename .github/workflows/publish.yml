@@ -1,0 +1,100 @@
+name: Publish to PyPI
+
+on:
+  # pull_request_target runs the workflow definition from main, so merged pull
+  # requests from forks can still use the PyPI secret.
+  pull_request_target:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pypi
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and build distribution
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      # Build the merge commit that landed on main, never the pull request head.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Check whether this version is already on PyPI
+        id: version
+        run: |
+          version=$(uv run --no-project --python 3.11 python -c \
+            "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://pypi.org/pypi/llm-microsoft-foundry/$version/json")
+          if [ "$status" = "200" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Version $version is already on PyPI; skipping publish. Bump the version in pyproject.toml to release."
+          elif [ "$status" = "404" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Version $version is not on PyPI yet; it will be published."
+          else
+            echo "::error::Unexpected HTTP $status from PyPI while checking version $version."
+            exit 1
+          fi
+
+      - name: Run tests
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          uv sync --python 3.11
+          uv run pytest
+
+      - name: Build package
+        if: steps.version.outputs.publish == 'true'
+        run: uv build
+
+      - name: Check package metadata
+        if: steps.version.outputs.publish == 'true'
+        run: uvx twine check dist/*
+
+      - name: Upload build artifacts
+        if: steps.version.outputs.publish == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish ${{ needs.build.outputs.version }} to PyPI
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/llm-microsoft-foundry/${{ needs.build.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          password: ${{ secrets.PYPI_API_TOKEN }}
